@@ -1,0 +1,581 @@
+
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+from torch.utils.data import Dataset, DataLoader
+import numpy as np
+from torch import optim
+from tqdm import tqdm
+import math
+from dataclasses import dataclass
+from typing import Union
+import pickle
+from sklearn.metrics import accuracy_score, f1_score, recall_score, precision_score, roc_auc_score
+import time
+import torch.optim as optim
+from torch.optim.lr_scheduler import StepLR
+from sklearn.model_selection import KFold
+from sklearn.metrics import accuracy_score, f1_score, recall_score, precision_score, roc_auc_score, mean_squared_error, \
+    mean_absolute_error
+import matplotlib.pyplot as plt
+import logging
+import os
+
+def npo2(len):
+    return 2 ** math.ceil(math.log2(len))
+
+def pad_npo2(X):
+    len_npo2 = npo2(X.size(1))
+    pad_tuple = (0, 0, 0, 0, 0, len_npo2 - X.size(1))
+    return F.pad(X, pad_tuple, "constant", 0)
+
+class PScan(torch.autograd.Function):
+    @staticmethod
+    def pscan(A, X):
+        B, D, L, _ = A.size()
+        num_steps = int(math.log2(L))
+        Aa = A
+        Xa = X
+        for _ in range(num_steps - 2):
+            T = Xa.size(2)
+            Aa = Aa.view(B, D, T // 2, 2, -1)
+            Xa = Xa.view(B, D, T // 2, 2, -1)
+            Xa[:, :, :, 1].add_(Aa[:, :, :, 1].mul(Xa[:, :, :, 0]))
+            Aa[:, :, :, 1].mul_(Aa[:, :, :, 0])
+            Aa = Aa[:, :, :, 1]
+            Xa = Xa[:, :, :, 1]
+        if Xa.size(2) == 4:
+            Xa[:, :, 1].add_(Aa[:, :, 1].mul(Xa[:, :, 0]))
+            Aa[:, :, 1].mul_(Aa[:, :, 0])
+            Xa[:, :, 3].add_(Aa[:, :, 3].mul(Xa[:, :, 2] + Aa[:, :, 2].mul(Xa[:, :, 1])))
+        elif Xa.size(2) == 2:
+            Xa[:, :, 1].add_(Aa[:, :, 1].mul(Xa[:, :, 0]))
+            return
+        else:
+            return
+        Aa = A[:, :, 2 ** (num_steps - 2) - 1:L:2 ** (num_steps - 2)]
+        Xa = X[:, :, 2 ** (num_steps - 2) - 1:L:2 ** (num_steps - 2)]
+        Xa[:, :, 2].add_(Aa[:, :, 2].mul(Xa[:, :, 1]))
+        Aa[:, :, 2].mul_(Aa[:, :, 1])
+        for k in range(num_steps - 3, -1, -1):
+            Aa = A[:, :, 2 ** k - 1:L:2 ** k]
+            Xa = X[:, :, 2 ** k - 1:L:2 ** k]
+            T = Xa.size(2)
+            Aa = Aa.view(B, D, T // 2, 2, -1)
+            Xa = Xa.view(B, D, T // 2, 2, -1)
+            Xa[:, :, 1:, 0].add_(Aa[:, :, 1:, 0].mul(Xa[:, :, :-1, 1]))
+            Aa[:, :, 1:, 0].mul_(Aa[:, :, :-1, 1])
+
+    @staticmethod
+    def pscan_rev(A, X):
+        B, D, L, _ = A.size()
+        num_steps = int(math.log2(L))
+        Aa = A
+        Xa = X
+        for _ in range(num_steps - 2):
+            T = Xa.size(2)
+            Aa = Aa.view(B, D, T // 2, 2, -1)
+            Xa = Xa.view(B, D, T // 2, 2, -1)
+            Xa[:, :, :, 0].add_(Aa[:, :, :, 0].mul(Xa[:, :, :, 1]))
+            Aa[:, :, :, 0].mul_(Aa[:, :, :, 1])
+            Aa = Aa[:, :, :, 0]
+            Xa = Xa[:, :, :, 0]
+        if Xa.size(2) == 4:
+            Xa[:, :, 2].add_(Aa[:, :, 2].mul(Xa[:, :, 3]))
+            Aa[:, :, 2].mul_(Aa[:, :, 3])
+            Xa[:, :, 0].add_(Aa[:, :, 0].mul(Xa[:, :, 1].add(Aa[:, :, 1].mul(Xa[:, :, 2]))))
+        elif Xa.size(2) == 2:
+            Xa[:, :, 0].add_(Aa[:, :, 0].mul(Xa[:, :, 1]))
+            return
+        else:
+            return
+        Aa = A[:, :, 0:L:2 ** (num_steps - 2)]
+        Xa = X[:, :, 0:L:2 ** (num_steps - 2)]
+        Xa[:, :, 1].add_(Aa[:, :, 1].mul(Xa[:, :, 2]))
+        Aa[:, :, 1].mul_(Aa[:, :, 2])
+        for k in range(num_steps - 3, -1, -1):
+            Aa = A[:, :, 0:L:2 ** k]
+            Xa = X[:, :, 0:L:2 ** k]
+            T = Xa.size(2)
+            Aa = Aa.view(B, D, T // 2, 2, -1)
+            Xa = Xa.view(B, D, T // 2, 2, -1)
+            Xa[:, :, :-1, 1].add_(Aa[:, :, :-1, 1].mul(Xa[:, :, 1:, 0]))
+            Aa[:, :, :-1, 1].mul_(Aa[:, :, 1:, 0])
+
+    @staticmethod
+    def forward(ctx, A_in, X_in):
+        L = X_in.size(1)
+        if L == npo2(L):
+            A = A_in.clone()
+            X = X_in.clone()
+        else:
+            A = pad_npo2(A_in)
+            X = pad_npo2(X_in)
+        A = A.transpose(2, 1)
+        X = X.transpose(2, 1)
+        PScan.pscan(A, X)
+        ctx.save_for_backward(A_in, X)
+        return X.transpose(2, 1)[:, :L]
+
+    @staticmethod
+    def backward(ctx, grad_output_in):
+        A_in, X = ctx.saved_tensors
+        L = grad_output_in.size(1)
+        if L == npo2(L):
+            grad_output = grad_output_in.clone()
+        else:
+            grad_output = pad_npo2(grad_output_in)
+            A_in = pad_npo2(A_in)
+        grad_output = grad_output.transpose(2, 1)
+        A_in = A_in.transpose(2, 1)
+        A = torch.nn.functional.pad(A_in[:, :, 1:], (0, 0, 0, 1))
+        PScan.pscan_rev(A, grad_output)
+        Q = torch.zeros_like(X)
+        Q[:, :, 1:].add_(X[:, :, :-1] * grad_output[:, :, 1:])
+        return Q.transpose(2, 1)[:, :L], grad_output.transpose(2, 1)[:, :L]
+
+pscan = PScan.apply
+
+@dataclass
+class MambaConfig:
+    d_model: int
+    n_layers: int
+    dt_rank: Union[int, str] = 'auto'
+    d_state: int = 19
+    expand_factor: int = 2
+    d_conv: int = 4
+    dt_min: float = 0.001
+    dt_max: float = 0.1
+    dt_init: str = "random"
+    dt_scale: float = 1.0
+    dt_init_floor = 1e-4
+    bias: bool = False
+    conv_bias: bool = True
+    pscan: bool = True
+
+    def __post_init__(self):
+        self.d_inner = 19
+        if self.dt_rank == 'auto':
+            self.dt_rank = math.ceil(self.d_model / 19)
+
+class Mamba(nn.Module):
+    def __init__(self, config: MambaConfig):
+        super().__init__()
+        self.config = config
+        self.layers = nn.ModuleList([ResidualBlock(config) for _ in range(config.n_layers)])
+
+    def forward(self, x, adjacency_matrix):
+        for layer in self.layers:
+            x = layer(x, adjacency_matrix)
+        return x
+
+    def step(self, x, caches, adjacency_matrix):
+        for i, layer in enumerate(self.layers):
+            x = layer.step(x, caches[i], adjacency_matrix)
+        return x, caches
+
+class ResidualBlock(nn.Module):
+    def __init__(self, config: MambaConfig):
+        super().__init__()
+        self.mixer = MambaBlock(config)
+        self.norm = RMSNorm(config.d_model)
+
+    def forward(self, x, adjacency_matrix):
+        output = self.mixer(self.norm(x), adjacency_matrix) + x
+        return output
+
+    def step(self, x, cache, adjacency_matrix):
+        output, cache = self.mixer.step(self.norm(x), cache, adjacency_matrix)
+        output = output + x
+        return output, cache
+
+class MambaBlock(nn.Module):
+    def __init__(self, config: MambaConfig):
+        super().__init__()
+        self.config = config
+        self.in_proj = nn.Linear(config.d_model, 2 * config.d_inner, bias=config.bias)
+        self.conv1d = nn.Conv1d(in_channels=19, out_channels=config.d_inner, kernel_size=config.d_conv,
+                                bias=config.conv_bias, groups=config.d_inner, padding=config.d_conv - 1)
+        self.x_proj = nn.Linear(config.d_inner, config.dt_rank + 2 * config.d_state, bias=False)
+        self.dt_proj = nn.Linear(config.dt_rank, config.d_inner, bias=True)
+        dt_init_std = config.dt_rank ** -0.5 * config.dt_scale
+        if config.dt_init == "constant":
+            nn.init.constant_(self.dt_proj.weight, dt_init_std)
+        elif config.dt_init == "random":
+            nn.init.uniform_(self.dt_proj.weight, -dt_init_std, dt_init_std)
+        dt = torch.exp(torch.rand(config.d_inner) * (math.log(config.dt_max) - math.log(config.dt_min)) + math.log(
+            config.dt_min)).clamp(min=config.dt_init_floor)
+        inv_dt = dt + torch.log(-torch.expm1(-dt))
+        with torch.no_grad():
+            self.dt_proj.bias.copy_(inv_dt)
+        A = torch.arange(1, config.d_state + 1, dtype=torch.float32).repeat(config.d_inner, 1)
+        self.A_log = nn.Parameter(torch.log(A))
+        self.D = nn.Parameter(torch.ones(config.d_inner))
+        self.out_proj = nn.Linear(config.d_inner, config.d_model, bias=config.bias)
+        self.similarity_matrix = nn.Linear(config.d_model, config.d_model, bias=False)
+
+    def forward(self, x, adjacency_matrix):
+        _, L, _ = x.shape
+        xz = self.in_proj(x)
+        x, z = xz.chunk(2, dim=-1)
+        x = x.transpose(1, 2)
+        x = self.conv1d(x)[:, :, :L]
+        x = x.transpose(1, 2)
+        x = F.silu(x)
+        y = self.ssm(x, adjacency_matrix)
+        z = F.silu(z)
+        output = y * z
+        output = self.out_proj(output)
+        similarity = self.similarity_matrix(output)
+        return similarity
+
+    def ssm(self, x, adjacency_matrix):
+        A = -torch.exp(self.A_log.float())
+        D = self.D.float()
+        deltaBC = self.x_proj(x)
+        delta, B, C = torch.split(deltaBC, [self.config.dt_rank, self.config.d_state, self.config.d_state], dim=-1)
+        delta = F.softplus(self.dt_proj(delta))
+        if self.config.pscan:
+            y = self.selective_scan(x, delta, A, B, C, D, adjacency_matrix)
+        else:
+            y = self.selective_scan_seq(x, delta, A, B, C, D, adjacency_matrix)
+        return y
+
+    def selective_scan(self, x, delta, A, B, C, D, adjacency_matrix):
+        deltaA = torch.exp(delta.unsqueeze(-1) * A)
+        deltaB = delta.unsqueeze(-1) * B.unsqueeze(2)
+        BX = deltaB * (x.unsqueeze(-1))
+        hs = pscan(deltaA, BX)
+        y = (hs @ C.unsqueeze(-1)).squeeze(3)
+        y = y + D * x
+        y = torch.matmul(adjacency_matrix, y)
+        return y
+
+    def selective_scan_seq(self, x, delta, A, B, C, D, adjacency_matrix):
+        _, L, _ = x.shape
+        deltaA = torch.exp(delta.unsqueeze(-1) * A)
+        deltaB = delta.unsqueeze(-1) * B.unsqueeze(2)
+        BX = deltaB * (x.unsqueeze(-1))
+        h = torch.zeros(x.size(0), self.config.d_inner, self.config.d_state, device=deltaA.device)
+        hs = []
+        for t in range(0, L):
+            h = deltaA[:, t] * h + BX[:, t]
+            hs.append(h)
+        hs = torch.stack(hs, dim=1)
+        y = (hs @ C.unsqueeze(-1)).squeeze(3)
+        y = y + D * x
+        y = torch.matmul(adjacency_matrix, y)
+        return y
+
+    def step(self, x, cache, adjacency_matrix):
+        h, inputs = cache
+        xz = self.in_proj(x)
+        x, z = xz.chunk(2, dim=1)
+        x_cache = x.unsqueeze(2)
+        x = self.conv1d(torch.cat([inputs, x_cache], dim=2))[:, :, self.config.d_conv - 1]
+        x = F.silu(x)
+        y, h = self.ssm_step(x, h, adjacency_matrix)
+        z = F.silu(z)
+        output = y * z
+        output = self.out_proj(output)
+        inputs = torch.cat([inputs[:, :, 1:], x_cache], dim=2)
+        cache = (h, inputs)
+        return output, cache
+
+    def ssm_step(self, x, h, adjacency_matrix):
+        A = -torch.exp(self.A_log.float())
+        D = self.D.float()
+        deltaBC = self.x_proj(x)
+        delta, B, C = torch.split(deltaBC, [self.config.dt_rank, self.config.d_state, self.config.d_state], dim=-1)
+        delta = F.softplus(self.dt_proj(delta))
+        deltaA = torch.exp(delta.unsqueeze(-1) * A)
+        deltaB = delta.unsqueeze(-1) * B.unsqueeze(1)
+        BX = deltaB * (x.unsqueeze(-1))
+        if h is None:
+            h = torch.zeros(x.size(0), self.config.d_inner, self.config.d_state, device=deltaA.device)
+        h = deltaA * h + BX
+        y = (h @ C.unsqueeze(-1)).squeeze(2)
+        y = y + D * x
+        y = torch.matmul(adjacency_matrix, y)
+        return y, h.squeeze(1)
+
+class RMSNorm(nn.Module):
+    def __init__(self, d_model: int, eps: float = 1e-5):
+        super().__init__()
+        self.eps = eps
+        self.weight = nn.Parameter(torch.ones(d_model))
+
+    def forward(self, x):
+        if isinstance(x, tuple):
+            x = x[0]
+        output = x * torch.rsqrt(x.pow(2).mean(-1, keepdim=True) + self.eps) * self.weight
+        return output
+
+class GraphConv(nn.Module):
+    def __init__(self, N, in_dim, out_dim, dropout):
+        super(GraphConv, self).__init__()
+        self.N = N
+        self.dropout = dropout
+        self.lin = nn.Linear(in_dim, out_dim)
+        self.dropout = nn.Dropout(dropout)
+        self.reset_parameters()
+
+    def forward(self, x, adj=None):
+        if adj is None:
+            adj = torch.eye(self.N).to(x.device)
+        x = torch.matmul(adj, x)
+        x = self.dropout(F.relu(self.lin(x)))
+        return x
+
+    def reset_parameters(self):
+        pass
+
+class MultilayerGNN(nn.Module):
+    def __init__(self, N, layer_num, pooling, in_dim, hid_dim, out_dim, dropout=0.2):
+        super(MultilayerGNN, self).__init__()
+        self.gnns = nn.ModuleList()
+
+        self.gnns.append(GraphConv(N, in_dim, hid_dim, dropout))
+        for _ in range(layer_num - 2):
+            self.gnns.append(GraphConv(N, hid_dim, hid_dim, dropout))
+        self.gnns.append(GraphConv(N, hid_dim, out_dim, dropout))
+
+    def forward(self, x, adj):
+        for gnn in self.gnns:
+            x = gnn(x, adj)
+        return x
+
+class GraphMamba(nn.Module):
+    def __init__(self, config: MambaConfig):
+        super().__init__()
+        self.config = config
+        self.embedding = nn.Linear(2000, 19)
+        self.graph_conv = DynamicGraphConv(19, 19)
+        self.multilayer_gnn = MultilayerGNN(N=19, layer_num=3, pooling=None, in_dim=19, hid_dim=19, out_dim=19,
+                                            dropout=0.2)
+        self.mamba = Mamba(config)
+        self.final_layer = nn.Linear(19, 4)
+        self.dropout = nn.Dropout(p=0.2)
+        self.softmax = nn.Softmax(dim=1)
+        self.similarity_matrix = nn.Linear(19, 19, bias=False)
+        self.probability_distribution = nn.Softmax(dim=-1)
+        self.temperature = torch.tensor(0.5, requires_grad=True)
+
+    def forward(self, x, temperature):
+        x = self.embedding(x)
+        x = self.dropout(x)
+        x = x.permute(0, 2, 1)
+        x, adjacency_matrix = self.graph_conv(x, temperature)
+        x = self.multilayer_gnn(x, adjacency_matrix)
+        x = self.mamba(x, adjacency_matrix)
+        similarity = self.similarity_matrix(x)
+        probability = self.probability_distribution(similarity)
+        x = x * probability
+        x = self.dropout(x)
+        x = x.mean(dim=1)
+        x = self.final_layer(x)
+        x = self.softmax(x)
+        return x
+
+class DynamicGraphConv(nn.Module):
+    def __init__(self, in_features, out_features):
+        super(DynamicGraphConv, self).__init__()
+        self.in_features = in_features
+        self.out_features = out_features
+        self.weight = nn.Parameter(torch.FloatTensor(in_features, out_features))
+        self.temperature = torch.tensor(0.5, requires_grad=True)
+        self.reset_parameters()
+        self.first_plot = True
+
+    def reset_parameters(self):
+        stdv = 1. / math.sqrt(self.weight.size(1))
+        self.weight.data.uniform_(-stdv, stdv)
+
+    def plot_distribution(self, data, title):
+        if self.first_plot:
+            plt.figure()
+            plt.hist(data.detach().cpu().numpy().flatten(), bins=50)
+            plt.title(title)
+            plt.show()
+            self.first_plot = False
+
+    def forward(self, x, temperature):
+        x_norm = F.normalize(x, p=2, dim=1)
+        similarity = torch.matmul(x_norm, x_norm.transpose(1, 2))
+        for i in range(similarity.size(0)):
+            similarity[i].fill_diagonal_(1)
+        probability = F.softmax(similarity / temperature, dim=2)
+        self.plot_distribution(probability, "Probability Distribution")
+        support = torch.matmul(probability, x)
+        output = torch.matmul(support, self.weight)
+        return output, probability
+
+def eeg_data_reader(data_dir, mode, shuffle=True):
+    data_files = []
+    label_files = []
+
+    for file in os.listdir(data_dir):
+        if mode in file and file.endswith('.npy'):
+            if '_label' in file:
+                label_files.append(file)
+            else:
+                data_files.append(file)
+
+    data_files.sort()
+    label_files.sort()
+
+    data = [np.load(os.path.join(data_dir, file)) for file in data_files]
+    labels = [np.load(os.path.join(data_dir, file)) for file in label_files]
+
+    if shuffle:
+        indices = np.arange(len(data))
+        np.random.shuffle(indices)
+        data = [data[i] for i in indices]
+        labels = [labels[i] for i in indices]
+
+    return data, labels
+
+def preprocess_data(data, labels, window_size=2000, step_size=2000):
+    channels = 19
+    windowed_data = []
+    windowed_labels = []
+
+    for i in range(len(data)):
+        reshaped_data = data[i].reshape(-1, channels, data[i].shape[1])
+        for start in range(0, reshaped_data.shape[2] - window_size + 1, step_size):
+            end = start + window_size
+            windowed_data.append(reshaped_data[0, :, start:end])
+            windowed_labels.append(labels[i])
+
+    windowed_data = np.array(windowed_data)
+    windowed_labels = np.array(windowed_labels)
+
+    windowed_data = torch.from_numpy(windowed_data).float()
+    windowed_labels = torch.from_numpy(windowed_labels).long()
+    return windowed_data, windowed_labels
+
+class EEGDataSet(Dataset):
+    def __init__(self, data, labels):
+        self.data = data
+        self.labels = labels
+
+    def __len__(self):
+        return len(self.data)
+
+    def __getitem__(self, idx):
+        data = self.data[idx]
+        label = self.labels[idx]
+        return idx, data, label
+
+def find_best_threshold(labels, preds, metric_func, average='weighted', initial_threshold=0.5, step=0.01):
+    best_threshold = initial_threshold
+    best_metric = metric_func(labels, np.argmax(preds, axis=1), average=average)
+
+    for threshold in np.arange(0, 1, step):
+        binary_preds = (preds >= threshold).astype(int)
+        metric = metric_func(labels, np.argmax(binary_preds, axis=1), average=average)
+        if metric > best_metric:
+            best_metric = metric
+            best_threshold = threshold
+
+    return best_threshold
+
+def evaluate(model, data_loader, device, temperature):
+    model.eval()
+    all_preds = []
+    all_labels = []
+    with torch.no_grad():
+        for index, eeg, label in data_loader:
+            eeg = eeg.to(device)
+            label = label.to(device)
+            output = model(eeg, temperature)
+            preds = torch.softmax(output, dim=1)
+            all_preds.extend(preds.cpu().numpy())
+            all_labels.extend(label.cpu().numpy())
+    all_preds = np.array(all_preds)
+    all_labels = np.array(all_labels)
+    all_labels = all_labels.astype(int)
+    best_f1_threshold = find_best_threshold(all_labels, all_preds, f1_score, average='macro')
+    binary_preds = (all_preds >= best_f1_threshold).astype(int)
+    acc = accuracy_score(all_labels, np.argmax(binary_preds, axis=1))
+    f1 = f1_score(all_labels, np.argmax(binary_preds, axis=1), average='macro')
+    recall = recall_score(all_labels, np.argmax(binary_preds, axis=1), average='macro')
+    precision = precision_score(all_labels, np.argmax(binary_preds, axis=1), average='macro', zero_division=1)
+    auroc = roc_auc_score(all_labels, all_preds, multi_class='ovr')
+    mse = mean_squared_error(all_labels, np.argmax(binary_preds, axis=1))
+    mae = mean_absolute_error(all_labels, np.argmax(binary_preds, axis=1))
+    return acc, f1, recall, precision, auroc, mse, mae, best_f1_threshold
+
+def main():
+    config = MambaConfig(d_model=19, n_layers=3)
+    model = GraphMamba(config)
+    device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+    model = model.to(device)
+
+    data_dir = r'filepath'
+    train_data, train_labels = eeg_data_reader(data_dir, 'train')
+    test_data, test_labels = eeg_data_reader(data_dir, 'test')
+    dev_data, dev_labels = eeg_data_reader(data_dir, 'dev')
+
+    train_data, train_labels = preprocess_data(train_data, train_labels)
+    test_data, test_labels = preprocess_data(test_data, test_labels)
+
+    test_dataset = EEGDataSet(test_data, test_labels)
+    test_loader = DataLoader(test_dataset, batch_size=20, shuffle=False)
+
+    kf = KFold(n_splits=4, shuffle=True, random_state=42)
+    criterion = nn.CrossEntropyLoss()
+
+    total_training_time = 0
+    temperature = torch.tensor(0.5, requires_grad=True, device=device)
+    num_classes = 4
+
+    for fold, (train_index, val_index) in enumerate(kf.split(train_data)):
+        print(f'Fold {fold + 1}')
+        train_fold_data, val_fold_data = train_data[train_index], train_data[val_index]
+        train_fold_labels, val_fold_labels = train_labels[train_index], train_labels[val_index]
+
+        train_fold_dataset = EEGDataSet(train_fold_data, train_fold_labels)
+        val_fold_dataset = EEGDataSet(val_fold_data, val_fold_labels)
+        train_loader = DataLoader(train_fold_dataset, batch_size=19, shuffle=True)
+        val_loader = DataLoader(val_fold_dataset, batch_size=19, shuffle=False)
+
+        optimizer = optim.Adam([{'params': temperature}], lr=0.001, weight_decay=1e-5)
+        scheduler = optim.lr_scheduler.StepLR(optimizer, step_size=10, gamma=0.1)
+
+        start_time = time.time()
+
+        for epoch in range(30):
+            model.train()
+            train_loss = 0.0
+            for index, eeg, label in tqdm(train_loader, desc=f'Epoch {epoch + 1}/{30}', leave=False):
+                eeg = eeg.to(device)
+                label = label.to(device)
+                optimizer.zero_grad()
+                output = model(eeg, temperature)
+                loss = criterion(output, label.squeeze())
+                loss.backward()
+                torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
+                optimizer.step()
+                train_loss += loss.item()
+
+            scheduler.step()
+
+            acc, f1, recall, precision, auroc, mse, mae, best_f1_threshold = evaluate(model, val_loader, device,
+                                                                                    temperature)
+            print(
+                f'Epoch {epoch + 1}/{30}, Train Loss: {train_loss / len(train_loader)}, Val Accuracy: {acc}, F1: {f1}, Recall: {recall}, Precision: {precision}, AUROC: {auroc}, MSE: {mse}, MAE: {mae}, Best F1 Threshold: {best_f1_threshold}')
+
+        end_time = time.time()
+        fold_training_time = end_time - start_time
+        total_training_time += fold_training_time
+        print(f'Fold {fold + 1} Training Time: {fold_training_time:.2f} seconds')
+
+    print(f'Total Training Time: {total_training_time:.2f} seconds')
+
+    acc, f1, recall, precision, auroc, mse, mae, best_f1_threshold = evaluate(model, test_loader, device, temperature)
+    print(
+        f'Final Evaluation - Acc: {acc:.4f}, F1: {f1:.4f}, Recall: {recall:.4f}, Precision: {precision:.4f}, AUROC: {auroc:.4f}, MSE: {mse:.4f}, MAE: {mae:.4f}, Best F1 Threshold: {best_f1_threshold}')
+
+if __name__ == "__main__":
+    main()
